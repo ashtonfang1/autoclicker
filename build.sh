@@ -1,5 +1,5 @@
 #!/usr/bin/env zsh
-# Build the Autoclicker .app bundle with py2app.
+# Build the macOS autoclicker .app bundle with py2app.
 #
 # py2app 0.28.10 + modulegraph 0.19.7 have a known AST-walker bug on
 # Python 3.13, and the `rubicon` namespace package ships without an
@@ -8,6 +8,7 @@
 # build works. It is idempotent and only touches the installed package.
 set -e
 
+APP_PATH="dist/macOS autoclicker.app"
 RUBICON_DIR="$(python3 -c 'import rubicon.objc, os; print(os.path.dirname(os.path.dirname(rubicon.objc.__file__)))')"
 if [ ! -f "$RUBICON_DIR/__init__.py" ]; then
     printf '__path__ = __import__("pkgutil").extend_path(__path__, __name__)\n' > "$RUBICON_DIR/__init__.py"
@@ -15,4 +16,11 @@ fi
 
 rm -rf build dist
 python3 setup.py py2app
-echo "Built: dist/Autoclicker.app"
+if [ -n "${CODESIGN_IDENTITY:-}" ]; then
+    codesign --force --deep --sign "$CODESIGN_IDENTITY" \
+        --identifier "com.ashton.autoclicker" "$APP_PATH"
+    echo "Signed app with: $CODESIGN_IDENTITY"
+else
+    echo "WARNING: no CODESIGN_IDENTITY set; this is an ad-hoc build and macOS may require permissions again after rebuilding."
+fi
+echo "Built: $APP_PATH"

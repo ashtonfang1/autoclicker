@@ -1,15 +1,17 @@
 from setuptools import setup
 
 APP = ["autoclicker.py"]
-DATA_FILES = []
+APP_ICON = "app-icon.icns"
+DATA_FILES = [('Resources', ['README.md', APP_ICON])]
 OPTIONS = {
     "argv_emulation": False,
     "packages": ["pyautogui", "pynput"],
     "excludes": ["PIL", "numpy", "cv2", "matplotlib"],
+    "iconfile": APP_ICON,
     "plist": {
-        "CFBundleName": "Autoclicker",
-        "CFBundleDisplayName": "Autoclicker",
-        "CFBundleIdentifier": "com.tinyman.autoclicker",
+        "CFBundleName": "macOS autoclicker",
+        "CFBundleDisplayName": "macOS autoclicker",
+        "CFBundleIdentifier": "com.ashton.autoclicker",
         "CFBundleVersion": "1.0.0",
         "CFBundlePackageType": "APPL",
         "NSHighResolutionCapable": True,
@@ -18,6 +20,7 @@ OPTIONS = {
 }
 
 setup(
+    name="macOS autoclicker",
     app=APP,
     data_files=DATA_FILES,
     options={"py2app": OPTIONS},
