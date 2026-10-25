@@ -1,0 +1,4 @@
+pyautogui
+pynput
+py2app
+rubicon-objc

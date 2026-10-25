@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# py2app build artifacts
+*.app.zip
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
