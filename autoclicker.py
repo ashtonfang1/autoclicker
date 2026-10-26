@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """A small macOS mouse and keyboard automation app."""
 
+import ctypes
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import math
+import os
 import platform
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -20,16 +24,66 @@ APP_BUNDLE_ID = "com.ashton.autoclicker"
 LOG = logging.getLogger(APP_NAME)
 BACKTICK = chr(96)
 DELAY_UNIT_MS = {"ms": 1, "s": 1_000, "min": 60_000, "hr": 3_600_000}
+MIN_DELAY_MS = 20
+MIN_INTERVAL_SECONDS = MIN_DELAY_MS / 1_000
+
+
+def app_bundle_path(executable=None):
+    """Return the enclosing .app bundle for a packaged executable, if any."""
+    executable_path = Path(executable or sys.executable).resolve()
+    return next(
+        (parent for parent in executable_path.parents if parent.suffix == ".app"),
+        None,
+    )
 
 
 def delay_to_ms(value, unit):
-    """Convert a displayed delay to milliseconds, enforcing the 1 ms floor."""
-    return max(1, round(float(value) * DELAY_UNIT_MS[unit]))
+    """Convert a displayed delay to milliseconds without rounding away fractions."""
+    return float(value) * DELAY_UNIT_MS[unit]
+
+
+def write_json_atomically(path, data):
+    """Write JSON beside its destination and atomically replace the old file."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(data, temporary_file, indent=2)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, path)
+    except OSError:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def preserve_invalid_json(path):
+    """Keep invalid app data for recovery without loading it on every launch."""
+    backup_path = path.with_name(f"{path.name}.corrupt")
+    if backup_path.exists():
+        backup_path = path.with_name(f"{path.name}.{time.time_ns()}.corrupt")
+    path.replace(backup_path)
+    return backup_path
+
 
 try:
     import pyautogui
 except ImportError:
     pyautogui = None
+
+if pyautogui is not None:
+    pyautogui.PAUSE = 0
+    pyautogui.MINIMUM_DURATION = 0
+    if hasattr(pyautogui, "DARWIN_CATCH_UP_TIME"):
+        pyautogui.DARWIN_CATCH_UP_TIME = 0
 
 try:
     from pynput import keyboard, mouse
@@ -109,8 +163,15 @@ def is_ax_trusted():
     try:
         from ApplicationServices import AXIsProcessTrusted
     except ImportError:
+        LOG.exception("Accessibility preflight API is unavailable")
         return False
-    return bool(AXIsProcessTrusted())
+    try:
+        trusted = bool(AXIsProcessTrusted())
+    except Exception:
+        LOG.exception("Accessibility preflight check failed")
+        return False
+    LOG.debug("Accessibility preflight result: trusted=%s", trusted)
+    return trusted
 
 
 def is_input_monitoring_trusted():
@@ -118,10 +179,36 @@ def is_input_monitoring_trusted():
     if not IS_MACOS:
         return True
     try:
-        from ApplicationServices import CGPreflightListenEventAccess
-    except ImportError:
+        core_graphics = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        preflight = core_graphics.CGPreflightListenEventAccess
+        preflight.restype = ctypes.c_bool
+        trusted = bool(preflight())
+    except (AttributeError, OSError):
+        LOG.exception("Input Monitoring preflight check failed")
         return False
-    return bool(CGPreflightListenEventAccess())
+    LOG.debug("Input Monitoring preflight result: trusted=%s", trusted)
+    return trusted
+
+
+def request_input_monitoring_access():
+    """Request Input Monitoring access after an explicit user action."""
+    if not IS_MACOS:
+        LOG.error("Input Monitoring access requests are only supported on macOS")
+        return False
+    try:
+        core_graphics = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics"
+        )
+        request = core_graphics.CGRequestListenEventAccess
+        request.restype = ctypes.c_bool
+        granted = bool(request())
+    except (AttributeError, OSError):
+        LOG.exception("CGRequestListenEventAccess failed")
+        return False
+    LOG.info("CGRequestListenEventAccess returned: granted=%s", granted)
+    return granted
 
 
 def _open_system_settings_pane(pane):
@@ -138,30 +225,6 @@ def open_accessibility_prefs():
     _open_system_settings_pane("Privacy_Accessibility")
 
 
-def request_accessibility_permission():
-    try:
-        from ApplicationServices import (
-            AXIsProcessTrustedWithOptions,
-            kAXTrustedCheckOptionPrompt,
-        )
-    except ImportError:
-        LOG.exception("Accessibility permission API is unavailable")
-        return False
-    else:
-        return bool(
-            AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True})
-        )
-
-
-def request_input_monitoring_permission():
-    try:
-        from ApplicationServices import CGRequestListenEventAccess
-    except ImportError:
-        LOG.exception("Input Monitoring permission API is unavailable")
-        return False
-    return bool(CGRequestListenEventAccess())
-
-
 def open_input_monitoring_prefs():
     _open_system_settings_pane("Privacy_ListenEvent")
 
@@ -172,20 +235,57 @@ def configure_logging():
         if IS_MACOS
         else Path.home() / ".local" / "state"
     )
+    console_stream = sys.stderr if sys.stderr is not None else sys.__stderr__
     try:
         log_dir.mkdir(parents=True, exist_ok=True)
-        logging.basicConfig(
-            filename=log_dir / "macOS autoclicker.log",
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(message)s",
+        file_handler = RotatingFileHandler(
+            log_dir / "macOS autoclicker.log",
+            maxBytes=1_000_000,
+            backupCount=3,
+            encoding="utf-8",
         )
     except OSError as error:
-        logging.basicConfig(level=logging.INFO)
-        LOG.error("Could not open application log directory %s: %s", log_dir, error)
+        for handler in LOG.handlers[:]:
+            LOG.removeHandler(handler)
+            handler.close()
+        LOG.handlers.clear()
+        if console_stream is not None:
+            console_handler = logging.StreamHandler(console_stream)
+            console_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s"
+                )
+            )
+            LOG.addHandler(console_handler)
+        LOG.setLevel(logging.INFO)
+        LOG.propagate = False
+        LOG.error("Could not configure application log file in %s: %s", log_dir, error)
+    else:
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s"
+            )
+        )
+        for handler in LOG.handlers[:]:
+            LOG.removeHandler(handler)
+            handler.close()
+        LOG.handlers.clear()
+        LOG.setLevel(logging.DEBUG)
+        LOG.propagate = False
+        LOG.addHandler(file_handler)
+        if console_stream is not None:
+            console_handler = logging.StreamHandler(console_stream)
+            console_handler.setLevel(logging.INFO)
+            console_handler.setFormatter(
+                logging.Formatter("[%(levelname)s] %(message)s")
+            )
+            LOG.addHandler(console_handler)
     LOG.info(
-        "Starting app: bundle_id=%s executable=%s",
+        "=== Application Started: bundle_id=%s executable=%s bundle_path=%s ===",
         APP_BUNDLE_ID,
         sys.executable,
+        app_bundle_path(),
     )
 
 
@@ -205,7 +305,7 @@ def open_guide():
 class AutoClicker:
     def __init__(self):
         self.running = False
-        self.delay_ms = 1
+        self.delay_ms = MIN_DELAY_MS
         self._delay_unit = "ms"
         self.click_type = "left"
         self.mode = "autoclick"
@@ -235,7 +335,9 @@ class AutoClicker:
         self._action_keys = []
         self._keyboard_keys = []
         self._keyboard_controller = None
+        self.recordings = []
         self._capture_kind = None
+        self._capture_result_pending = False
         self._delay_placeholder_active = True
         self._keyboard_layout_context = None
         self._selected_recording = None
@@ -244,35 +346,55 @@ class AutoClicker:
             if IS_MACOS
             else Path.home() / ".local" / "share" / APP_NAME / "Recordings"
         )
+        self._recordings_order_path = self._recordings_dir / ".order.json"
+        self._recording_drag_start = None
+        self._recording_drag_selection = ()
+        self._recording_dragging = False
+        self._recording_drop_index = None
         self._was_trusted = None
         self._last_input_monitoring_trusted = None
         self._were_listener_permissions_trusted = None
+        self._trust_refresh_after_id = None
+        self._app_bundle_path = app_bundle_path()
 
         if _darwin_keycode_context is not None:
             with _darwin_keycode_context() as context:
                 self._keyboard_layout_context = context
 
         self.root = tk.Tk()
+        self.root.bind("<FocusIn>", self._schedule_trust_state_refresh, add="+")
         self.root.bind_all("<Button-1>", self._on_window_click, add="+")
         self._build_gui()
         self._refresh_trust_state()
-        self._start_hotkey_listener()
         self._refresh_recordings()
         self.root.after(150, self._clear_widget_focus)
-        self.root.after(1000, self._poll_trust_state)
 
     def _build_gui(self):
         self.root.title(APP_NAME)
         self.root.geometry("640x620")
         self.root.minsize(600, 580)
-        self.root.attributes("-topmost", True)
+        self.root.attributes("-topmost", False)
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=10)
-        controls = ttk.Frame(self.notebook, padding=12)
+        controls_page = ttk.Frame(self.notebook)
         recordings = ttk.Frame(self.notebook, padding=12)
-        self.notebook.add(controls, text="Controls")
+        self.notebook.add(controls_page, text="Controls")
         self.notebook.add(recordings, text="Recordings")
+
+        self.controls_canvas = tk.Canvas(controls_page, highlightthickness=0)
+        controls_scrollbar = ttk.Scrollbar(
+            controls_page, orient="vertical", command=self.controls_canvas.yview
+        )
+        self.controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+        self.controls_canvas.pack(side="left", fill="both", expand=True)
+        controls_scrollbar.pack(side="right", fill="y")
+        controls = ttk.Frame(self.controls_canvas, padding=12)
+        self._controls_canvas_window = self.controls_canvas.create_window(
+            (0, 0), window=controls, anchor="nw"
+        )
+        controls.bind("<Configure>", self._update_controls_scroll_region)
+        self.controls_canvas.bind("<Configure>", self._resize_controls_content)
 
         status_style = ttk.Style(self.root)
         status_style.configure("Status.TLabel", font=("TkDefaultFont", 14, "bold"))
@@ -361,6 +483,7 @@ class AutoClicker:
         ttk.Label(keyboard_row, text="Keyboard").pack(side="left")
         self.keyboard_keys_frame = ttk.Frame(actions)
         self.keyboard_keys_frame.pack(fill="x", padx=(25, 0), pady=(2, 5))
+        self.keyboard_keys_frame.bind("<Configure>", self._layout_keyboard_keys)
         self.keyboard_add_btn = ttk.Button(
             keyboard_row, text="+", width=2, style="Compact.TButton",
             command=self._add_keyboard_key,
@@ -421,40 +544,28 @@ class AutoClicker:
         ttk.Label(
             hotkey_frame, text="Custom Start/stop key:", foreground="gray"
         ).pack(pady=(0, 4))
+        hotkey_control_row = ttk.Frame(hotkey_frame)
+        hotkey_control_row.pack()
         self.set_hotkey_btn = ttk.Button(
-            hotkey_frame,
+            hotkey_control_row,
             text="(click to add key)",
             command=self._set_hotkey_clicked,
         )
-        self.set_hotkey_btn.pack()
-        self.permissions_frame = ttk.Frame(controls)
-        self.permissions_frame.pack(fill="x", pady=(6, 0))
-        self.permission_row = ttk.Frame(self.permissions_frame)
-        self.permission_row.pack()
-        permission_style = ttk.Style(self.root)
-        permission_style.configure("Permission.TButton", foreground="#888888")
-        permission_style.configure(
-            "PermissionGranted.TButton", foreground="#2e8b57"
+        self.set_hotkey_btn.pack(side="left")
+        self.hotkey_error = ttk.Label(
+            hotkey_control_row, text="", foreground="#e57373"
         )
-        ttk.Label(self.permission_row, text="Required:").pack(side="left", padx=(0, 6))
-        self.grant_btn = ttk.Button(
-            self.permission_row,
-            text="☐ Request Accessibility",
-            style="Permission.TButton",
-            command=self._open_accessibility_settings,
-        )
-        self.input_monitoring_btn = ttk.Button(
-            self.permission_row,
-            text="☐ Request Input Monitoring",
-            style="Permission.TButton",
-            command=self._open_input_monitoring_settings,
-        )
+        self.hotkey_error.pack(side="left", padx=(8, 0))
         self.guide_btn = ttk.Button(
-            self.permissions_frame, text="Guide", command=self._open_guide
+            controls, text="Guide", command=self._open_guide
         )
-        self.grant_btn.pack(side="left")
-        self.input_monitoring_btn.pack(side="left", padx=(6, 0))
         self.guide_btn.pack(pady=(4, 0))
+        self.request_input_monitoring_btn = ttk.Button(
+            controls,
+            text="Request Input Monitoring",
+            command=self._request_input_monitoring,
+        )
+        self.request_input_monitoring_btn.pack(pady=(4, 0))
 
         self._build_recordings_tab(recordings)
         self._update_input_state()
@@ -462,9 +573,24 @@ class AutoClicker:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_recordings_tab(self, parent):
-        self.recordings_list = tk.Listbox(parent, activestyle="none")
+        self.recordings_list = tk.Listbox(
+            parent, activestyle="none", selectmode=tk.EXTENDED
+        )
         self.recordings_list.pack(fill="both", expand=True)
         self.recordings_list.bind("<<ListboxSelect>>", self._on_recording_selected)
+        self.recordings_list.bind("<Button-1>", self._on_recording_list_click)
+        self.recordings_list.bind("<Command-Button-1>", self._toggle_recording_selection)
+        self.recordings_list.bind("<Command-a>", self._select_all_recordings)
+        self.recordings_list.bind("<Command-A>", self._select_all_recordings)
+        self.recordings_list.bind("<ButtonPress-1>", self._recording_drag_press, add="+")
+        self.recordings_list.bind("<B1-Motion>", self._recording_drag_motion, add="+")
+        self.recordings_list.bind("<ButtonRelease-1>", self._recording_drag_release, add="+")
+        self._recording_drop_indicator = tk.Frame(
+            self.recordings_list.master, height=2, background="#0A84FF"
+        )
+        self._recording_drop_indicator.bind(
+            "<Button-1>", self._on_recording_indicator_click
+        )
         buttons = ttk.Frame(parent)
         buttons.pack(fill="x", pady=(8, 0))
         ttk.Button(buttons, text="Play selected", command=self._play_selected).pack(
@@ -476,11 +602,78 @@ class AutoClicker:
         ttk.Button(buttons, text="Refresh", command=self._refresh_recordings).pack(
             side="right"
         )
-        ttk.Label(
-            parent,
-            text="Recordings are saved as JSON in your application support folder.",
-            foreground="gray",
-        ).pack(anchor="w", pady=(8, 0))
+        playback_options = ttk.Frame(parent)
+        playback_options.pack(fill="x", pady=(8, 0))
+        ttk.Label(playback_options, text="Play").pack(side="left")
+        self._playback_count_placeholder_active = True
+        self.playback_count_var = tk.StringVar(master=self.root, value="e.g. 10")
+        validate_count = (self.root.register(self._validate_playback_count), "%P")
+        self.playback_count_entry = ttk.Entry(
+            playback_options,
+            textvariable=self.playback_count_var,
+            width=9,
+            validate="none",
+            validatecommand=validate_count,
+            style="Placeholder.TEntry",
+        )
+        self.playback_count_entry.pack(side="left", padx=(6, 6))
+        self.playback_count_entry.bind("<FocusIn>", self._on_playback_count_focus_in)
+        self.playback_count_entry.bind("<FocusOut>", self._on_playback_count_focus_out)
+        ttk.Label(playback_options, text="times").pack(side="left")
+        self.play_forever_var = tk.BooleanVar(master=self.root, value=False)
+        ttk.Checkbutton(
+            playback_options,
+            text="Play forever until stopped",
+            variable=self.play_forever_var,
+            command=self._update_playback_count_state,
+        ).pack(side="left", padx=(16, 0))
+        self.recordings_notice = ttk.Label(
+            parent, text="", foreground="#e57373", wraplength=560
+        )
+        self.recordings_notice.pack(anchor="w", pady=(4, 0))
+        self._update_playback_count_state()
+
+    @staticmethod
+    def _validate_playback_count(proposed):
+        return proposed == "" or all(
+            "0" <= character <= "9" for character in proposed
+        )
+
+    def _update_playback_count_state(self):
+        self.playback_count_entry.configure(
+            state="disabled" if self.play_forever_var.get() else "normal"
+        )
+
+    def _on_playback_count_focus_in(self, _=None):
+        if self._playback_count_placeholder_active:
+            self.playback_count_var.set("")
+            self._playback_count_placeholder_active = False
+        else:
+            self.playback_count_entry.selection_range(0, tk.END)
+        self.playback_count_entry.configure(
+            style="App.TEntry",
+            validate="key",
+        )
+
+    def _on_playback_count_focus_out(self, _=None):
+        if self.playback_count_var.get():
+            return
+        self._playback_count_placeholder_active = True
+        self.playback_count_entry.configure(
+            style="Placeholder.TEntry",
+            validate="none",
+        )
+        self.playback_count_var.set("e.g. 10")
+
+    def _update_controls_scroll_region(self, event):
+        self.controls_canvas.configure(
+            scrollregion=(0, 0, event.width, event.height)
+        )
+
+    def _resize_controls_content(self, event):
+        self.controls_canvas.itemconfigure(
+            self._controls_canvas_window, width=event.width
+        )
 
     def _validate_delay(self, proposed):
         if proposed in ("", "."):
@@ -490,7 +683,7 @@ class AutoClicker:
         except ValueError:
             return False
 
-    def _delay_entry_value(self):
+    def _delay_entry_value(self, unit=None):
         if self._delay_placeholder_active:
             return self.delay_ms
         text = self.delay_entry.get().strip()
@@ -502,10 +695,28 @@ class AutoClicker:
             return self.delay_ms
         if not math.isfinite(value) or value < 0:
             return self.delay_ms
-        return delay_to_ms(value, self._delay_unit)
+        return delay_to_ms(value, unit or self._delay_unit)
+
+    def _apply_delay_value(self, delay_ms, display_unit):
+        if delay_ms < MIN_DELAY_MS:
+            LOG.info(
+                "Configured delay was below 50 CPS threshold; "
+                "auto-corrected to 20 ms (50 CPS max)."
+            )
+            self.delay_ms = MIN_DELAY_MS
+            self._delay_unit = display_unit if display_unit in ("ms", "s") else "ms"
+        else:
+            self.delay_ms = max(MIN_DELAY_MS, round(delay_ms))
+            self._delay_unit = display_unit
+        self.delay_unit_var.set(self._delay_unit)
+        if not self._delay_placeholder_active:
+            self._show_delay_value()
 
     def _apply_delay(self):
-        self.delay_ms = self._delay_entry_value()
+        self._apply_delay_value(
+            self._delay_entry_value(),
+            self._delay_unit,
+        )
 
     def _show_delay_value(self):
         self._delay_placeholder_active = False
@@ -536,11 +747,9 @@ class AutoClicker:
             self.delay_entry.insert(0, "e.g. 10.0")
 
     def _on_delay_unit_change(self, _=None):
-        if not self._delay_placeholder_active:
-            self.delay_ms = self._delay_entry_value()
-        self._delay_unit = self.delay_unit_var.get()
-        if not self._delay_placeholder_active:
-            self._show_delay_value()
+        selected_unit = self.delay_unit_var.get()
+        delay_ms = self._delay_entry_value(self._delay_unit)
+        self._apply_delay_value(delay_ms, selected_unit)
 
     def _set_status(self, text):
         color = "#2e8b57" if text in ("Started", "Recording") else "#e57373"
@@ -555,14 +764,37 @@ class AutoClicker:
             child.destroy()
         enabled = self.keyboard_var.get()
         for index, key_data in enumerate(self._keyboard_keys):
-            button = ttk.Button(
+            ttk.Button(
                 self.keyboard_keys_frame,
                 text=f"{self._key_display(key_data)} ×",
                 style="KeyChip.TButton",
+                width=6,
                 command=lambda selected=index: self._remove_keyboard_key(selected),
                 state="normal" if enabled else "disabled",
             )
-            button.pack(side="left", padx=(0, 5))
+        self._layout_keyboard_keys()
+
+    def _layout_keyboard_keys(self, event=None):
+        available_width = (
+            event.width if event is not None
+            else self.keyboard_keys_frame.winfo_width()
+        )
+        if available_width <= 1:
+            return
+
+        buttons = self.keyboard_keys_frame.winfo_children()
+        if not buttons:
+            return
+
+        chip_width = max(button.winfo_reqwidth() for button in buttons)
+        column_count = max(1, (available_width + 5) // (chip_width + 5))
+        for index, button in enumerate(buttons):
+            button.grid(
+                row=index // column_count,
+                column=index % column_count,
+                sticky="w",
+                padx=(0, 5),
+            )
 
     def _key_display(self, key_data):
         if "char" in key_data:
@@ -586,11 +818,13 @@ class AutoClicker:
         if keyboard is None:
             messagebox.showerror(APP_NAME, "pynput is required to capture keys.")
             return
+        self._refresh_trust_state()
         if not self._has_listener_permissions():
             self._show_permissions_required()
             return
         self.capturing = True
         self._capture_kind = kind
+        self._capture_result_pending = False
         if kind == "keyboard":
             self.keyboard_add_btn.configure(text="...")
             self.keyboard_add_btn.focus_set()
@@ -599,7 +833,7 @@ class AutoClicker:
             self.set_hotkey_btn.focus_set()
         self._stop_hotkey_listener()
         self._capture_listener = self._new_keyboard_listener(
-            on_press=self._capture_key
+            on_press=self._capture_key,
         )
         self._capture_listener.daemon = True
         self._capture_listener.start()
@@ -636,7 +870,7 @@ class AutoClicker:
         if widget_class in {"Entry", "TEntry"}:
             return
         self._clear_entry_selection()
-        if widget_class != "TCombobox":
+        if widget_class not in {"TCombobox", "Listbox"}:
             self.root.after_idle(self._clear_widget_focus)
 
     def _clear_entry_selection(self, _=None):
@@ -685,7 +919,7 @@ class AutoClicker:
         trusted = is_ax_trusted()
         input_monitoring_trusted = is_input_monitoring_trusted()
         listener_permissions_trusted = trusted and input_monitoring_trusted
-        self._update_permission_indicators(trusted, input_monitoring_trusted)
+        previous_trusted = self._was_trusted
         permissions = (trusted, input_monitoring_trusted)
         if permissions != (
             self._was_trusted,
@@ -699,6 +933,21 @@ class AutoClicker:
                 input_monitoring_trusted,
                 sys.executable,
             )
+            if not trusted:
+                LOG.warning(
+                    "Accessibility permission is missing. Grant it to "
+                    "%s in System Settings > Privacy & Security > Accessibility.",
+                    APP_NAME,
+                )
+            if not input_monitoring_trusted:
+                LOG.warning(
+                    "Input Monitoring permission is missing. Grant it to "
+                    "%s in System Settings > Privacy & Security > Input Monitoring.",
+                    APP_NAME,
+                )
+        self._was_trusted = trusted
+        self._last_input_monitoring_trusted = input_monitoring_trusted
+        self._were_listener_permissions_trusted = listener_permissions_trusted
         if not trusted and (self.running or self._playing_recording):
             self._stop_action()
         if not listener_permissions_trusted:
@@ -707,6 +956,7 @@ class AutoClicker:
                 capture_kind = self._capture_kind
                 self.capturing = False
                 self._capture_kind = None
+                self._capture_result_pending = False
                 self._stop_capture_listener()
                 if capture_kind == "keyboard":
                     self.keyboard_add_btn.configure(text="+")
@@ -716,68 +966,78 @@ class AutoClicker:
                     )
             if self._is_recording:
                 self._stop_recording()
-        elif self._were_listener_permissions_trusted is False:
-            self._start_hotkey_listener()
-        if trusted and self._was_trusted is False and not (
+        if trusted and previous_trusted is False and not (
             self.running or self._is_recording or self._playing_recording
         ):
             self._set_status("Stopped")
-        self._was_trusted = trusted
-        self._last_input_monitoring_trusted = input_monitoring_trusted
-        self._were_listener_permissions_trusted = listener_permissions_trusted
 
-    def _update_permission_indicators(self, accessibility, input_monitoring):
-        self.grant_btn.configure(
-            text=f"{'☑' if accessibility else '☐'} Request Accessibility",
-            style="PermissionGranted.TButton" if accessibility else "Permission.TButton",
+    def _schedule_trust_state_refresh(self, _=None):
+        if self._trust_refresh_after_id is not None:
+            self.root.after_cancel(self._trust_refresh_after_id)
+        self._trust_refresh_after_id = self.root.after(
+            150, self._refresh_trust_state_after_focus
         )
-        self.input_monitoring_btn.configure(
-            text=f"{'☑' if input_monitoring else '☐'} Request Input Monitoring",
-            style=(
-                "PermissionGranted.TButton"
-                if input_monitoring
-                else "Permission.TButton"
-            ),
-        )
+
+    def _refresh_trust_state_after_focus(self):
+        self._trust_refresh_after_id = None
+        self._refresh_trust_state()
 
     def _has_listener_permissions(self):
-        return is_ax_trusted() and is_input_monitoring_trusted()
+        return bool(self._were_listener_permissions_trusted)
 
     def _show_permissions_required(self):
-        accessibility = is_ax_trusted()
-        input_monitoring = is_input_monitoring_trusted()
-        if not accessibility:
-            request_accessibility_permission()
-        if not input_monitoring:
-            request_input_monitoring_permission()
+        accessibility = bool(self._was_trusted)
+        input_monitoring = bool(self._last_input_monitoring_trusted)
         LOG.warning(
             "Required permissions missing: accessibility=%s input_monitoring=%s",
             accessibility,
             input_monitoring,
         )
-        messagebox.showwarning(
-            APP_NAME,
-            "Requires Input Monitoring and Accessibility.",
-        )
+        if not accessibility:
+            monitoring_status = "granted" if input_monitoring else "not granted"
+            if messagebox.askyesno(
+                "Permission Required",
+                "macOS currently reports Accessibility permission as not granted. "
+                f"Input Monitoring is {monitoring_status}. Open Accessibility "
+                "settings?",
+            ):
+                try:
+                    open_accessibility_prefs()
+                except (OSError, subprocess.CalledProcessError) as error:
+                    LOG.exception("Could not open Accessibility settings")
+                    messagebox.showerror(
+                        APP_NAME, f"Could not open Accessibility settings:\n{error}"
+                    )
+            return
+        if not input_monitoring:
+            if messagebox.askyesno(
+                "Permission Required",
+                "Accessibility is granted, but macOS reports Input Monitoring "
+                "as not granted. Key capture requires both permissions. Open "
+                "Input Monitoring settings?",
+            ):
+                try:
+                    open_input_monitoring_prefs()
+                except (OSError, subprocess.CalledProcessError) as error:
+                    LOG.exception("Could not open Input Monitoring settings")
+                    messagebox.showerror(
+                        APP_NAME,
+                        f"Could not open Input Monitoring settings:\n{error}",
+                    )
 
-    def _open_accessibility_settings(self):
+    def _show_accessibility_required(self):
+        LOG.warning("Accessibility is required for this action")
+        if not messagebox.askyesno(
+            "Permission Required",
+            "Accessibility permission is required. Open Accessibility settings?",
+        ):
+            return
         try:
-            if not is_ax_trusted():
-                request_accessibility_permission()
             open_accessibility_prefs()
         except (OSError, subprocess.CalledProcessError) as error:
+            LOG.exception("Could not open Accessibility settings")
             messagebox.showerror(
                 APP_NAME, f"Could not open Accessibility settings:\n{error}"
-            )
-
-    def _open_input_monitoring_settings(self):
-        try:
-            if not is_input_monitoring_trusted():
-                request_input_monitoring_permission()
-            open_input_monitoring_prefs()
-        except (OSError, subprocess.CalledProcessError) as error:
-            messagebox.showerror(
-                APP_NAME, f"Could not open Input Monitoring settings:\n{error}"
             )
 
     def _open_guide(self):
@@ -786,11 +1046,28 @@ class AutoClicker:
         except (OSError, subprocess.CalledProcessError) as error:
             messagebox.showerror(APP_NAME, f"Could not open the guide:\n{error}")
 
-    def _poll_trust_state(self):
-        if not self.root.winfo_exists():
-            return
-        self._refresh_trust_state()
-        self.root.after(1000, self._poll_trust_state)
+    def _request_input_monitoring(self):
+        granted = request_input_monitoring_access()
+        LOG.info(
+            "Input Monitoring request button clicked: granted=%s bundle_id=%s",
+            granted,
+            APP_BUNDLE_ID,
+        )
+        try:
+            open_input_monitoring_prefs()
+        except (OSError, subprocess.CalledProcessError) as error:
+            LOG.exception("Could not open Input Monitoring settings")
+            messagebox.showerror(
+                APP_NAME,
+                f"Could not open Input Monitoring settings:\n{error}",
+            )
+        messagebox.showinfo(
+            APP_NAME,
+            "Input Monitoring access was requested. macOS currently reports "
+            f"it as {'granted' if granted else 'not granted'}. If you turn it "
+            "On in System Settings, quit and reopen the app before testing "
+            "keyboard capture.",
+        )
 
     # Global start/stop key
     def _matches_hotkey(self, key):
@@ -805,6 +1082,7 @@ class AutoClicker:
     def _set_hotkey_clicked(self):
         if self.capturing:
             return
+        self.hotkey_error.configure(text="")
         if self.running:
             self._stop_action()
         if self.record_var.get():
@@ -812,9 +1090,9 @@ class AutoClicker:
         self._begin_key_capture("hotkey")
 
     def _capture_key(self, key):
-        if self.capturing:
+        if self.capturing and not self._capture_result_pending:
+            self._capture_result_pending = True
             self.root.after(0, lambda captured=key: self._on_hotkey_captured(captured))
-        return False
 
     def _on_hotkey_captured(self, key):
         if not self.capturing:
@@ -822,6 +1100,7 @@ class AutoClicker:
         capture_kind = self._capture_kind
         self.capturing = False
         self._capture_kind = None
+        self._capture_result_pending = False
         self._stop_capture_listener()
         if capture_kind == "keyboard":
             if key != keyboard.Key.esc:
@@ -832,6 +1111,14 @@ class AutoClicker:
             self.keyboard_add_btn.configure(text="+")
             self._start_hotkey_listener()
             return
+        if self._is_control_key(key):
+            self.hotkey_error.configure(text="Cannot be Ctrl")
+            self.set_hotkey_btn.configure(
+                text=self.hotkey_repr or "(click to add key)"
+            )
+            self._start_hotkey_listener()
+            return
+        self.hotkey_error.configure(text="")
         if key == keyboard.Key.esc:
             self.hotkey = None
             self.hotkey_repr = ""
@@ -853,7 +1140,9 @@ class AutoClicker:
         if keyboard is None:
             LOG.error("Cannot start hotkey listener: pynput keyboard is unavailable")
             return
-        if not self._has_listener_permissions():
+        if self.hotkey is None:
+            return
+        if not self._were_listener_permissions_trusted:
             LOG.warning("Cannot start hotkey listener: required permissions missing")
             return
         if self._listener is not None:
@@ -919,9 +1208,24 @@ class AutoClicker:
 
     # Live action loop
     def toggle_action(self):
+        self._refresh_trust_state()
+        self._start_hotkey_listener()
+        LOG.info(
+            "[ACTION BUTTON] Start/Stop toggled: running=%s playing_recording=%s "
+            "accessibility=%s input_monitoring=%s bundle_id=%s executable=%s "
+            "bundle_path=%s",
+            self.running,
+            self._playing_recording,
+            bool(self._was_trusted),
+            bool(self._last_input_monitoring_trusted),
+            APP_BUNDLE_ID,
+            sys.executable,
+            self._app_bundle_path,
+        )
         if self.running:
             self._stop_action()
         elif self._playing_recording:
+            LOG.info("Stop requested for recording playback")
             self._stop_event.set()
         else:
             self._start_action()
@@ -929,32 +1233,59 @@ class AutoClicker:
     def _start_action(self):
         if self.running:
             return
-        if not is_ax_trusted():
-            self._refresh_trust_state()
-            request_accessibility_permission()
+        self._apply_delay()
+        if not self._was_trusted:
             LOG.warning("Cannot start action: Accessibility permission is missing")
-            messagebox.showwarning(APP_NAME, "Requires Accessibility.")
+            self._show_accessibility_required()
             return
         if not self.mouse_var.get() and not (
             self.keyboard_var.get() and self._keyboard_keys
         ):
+            LOG.warning(
+                "Cannot start action: no enabled mouse or configured keyboard action"
+            )
             return
         self._action_mouse = self.mouse_var.get()
         self._action_keyboard = self.keyboard_var.get()
         self._action_mode = self.mode_var.get()
         self._action_keys = list(self._keyboard_keys)
-        if self._action_keyboard:
-            self._get_keyboard_controller()
-        self.running = True
-        self._stop_event.clear()
-        if self._action_mouse and self._action_mode == "hold":
-            pyautogui.mouseDown(button=self.click_type)
-        self._set_status("Started")
-        if not (self._action_mode == "hold" and self._action_mouse and not self._action_keyboard):
-            self.thread = threading.Thread(target=self._run_action_loop, daemon=True)
-            self.thread.start()
+        LOG.info(
+            "Starting action: mouse=%s keyboard=%s mode=%s click_type=%s "
+            "delay_ms=%s key_count=%s",
+            self._action_mouse,
+            self._action_keyboard,
+            self._action_mode,
+            self.click_type,
+            self.delay_ms,
+            len(self._action_keys),
+        )
+        try:
+            if self._action_keyboard:
+                self._get_keyboard_controller()
+            self.running = True
+            self._stop_event.clear()
+            if self._action_mouse and self._action_mode == "hold":
+                pyautogui.mouseDown(button=self.click_type)
+            self._set_status("Started")
+            if not (
+                self._action_mode == "hold"
+                and self._action_mouse
+                and not self._action_keyboard
+            ):
+                self.thread = threading.Thread(
+                    target=self._run_action_loop, daemon=True
+                )
+                self.thread.start()
+        except Exception as error:
+            self.running = False
+            self._stop_event.set()
+            self.thread = None
+            LOG.exception("Failed to initialize or start action")
+            self._set_status("Stopped")
+            messagebox.showerror(APP_NAME, f"Could not start action:\n{error}")
 
     def _run_action_loop(self):
+        LOG.info("Action worker started")
         try:
             while not self._stop_event.is_set() and self.running:
                 if self._action_mouse and self._action_mode == "autoclick":
@@ -971,12 +1302,27 @@ class AutoClicker:
                 ):
                     self._stop_event.wait(0.05)
                 else:
-                    self._stop_event.wait(max(1, self.delay_ms) / 1000.0)
+                    effective_interval = max(
+                        MIN_INTERVAL_SECONDS,
+                        self.delay_ms / 1_000,
+                    )
+                    self._stop_event.wait(effective_interval)
         except Exception as error:
-            LOG.exception("Action loop failed")
-            self.root.after(0, lambda failure=error: self._on_action_error(failure))
+            LOG.exception(
+                "Action worker failed: mouse=%s keyboard=%s mode=%s",
+                self._action_mouse,
+                self._action_keyboard,
+                self._action_mode,
+            )
+            if not self._closed:
+                self.root.after(
+                    0, lambda failure=error: self._on_action_error(failure)
+                )
+        finally:
+            LOG.info("Action worker exited")
 
     def _on_action_error(self, error):
+        LOG.error("Action failure reported to UI: %s", error)
         self._stop_action()
         messagebox.showerror(APP_NAME, f"Action failed:\n{error}")
 
@@ -989,10 +1335,20 @@ class AutoClicker:
 
     def _stop_action(self):
         was_running = self.running
+        LOG.info(
+            "Stopping action: was_running=%s mouse=%s keyboard=%s mode=%s",
+            was_running,
+            self._action_mouse,
+            self._action_keyboard,
+            self._action_mode,
+        )
         self.running = False
         self._stop_event.set()
         if was_running and self._action_mouse and self._action_mode == "hold":
-            pyautogui.mouseUp(button=self.click_type)
+            try:
+                pyautogui.mouseUp(button=self.click_type)
+            except Exception:
+                LOG.exception("Failed to release held mouse button while stopping")
         if self.thread is not None and self.thread is not threading.current_thread():
             self.thread.join(timeout=1.0)
         self.thread = None
@@ -1156,7 +1512,7 @@ class AutoClicker:
         )
         try:
             self._recordings_dir.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(recording, indent=2), encoding="utf-8")
+            write_json_atomically(path, recording)
         except OSError as error:
             messagebox.showerror(APP_NAME, "Could not save recording:\n%s" % error)
             return
@@ -1179,7 +1535,10 @@ class AutoClicker:
         result = {"name": None}
 
         def save():
+            if result["name"] is not None:
+                return
             result["name"] = name_var.get().strip() or default_name
+            save_button.configure(state="disabled")
             dialog.destroy()
 
         def discard():
@@ -1195,10 +1554,22 @@ class AutoClicker:
 
         buttons = ttk.Frame(content)
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Discard", command=discard).pack(side="right")
-        ttk.Button(buttons, text="Save", command=save).pack(
-            side="right", padx=(0, 8)
+        save_button = tk.Button(
+            buttons,
+            text="Save",
+            command=save,
+            background="#007AFF",
+            foreground="white",
+            activebackground="#0063CE",
+            activeforeground="white",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            padx=14,
+            pady=5,
         )
+        ttk.Button(buttons, text="Discard", command=discard).pack(side="left")
+        save_button.pack(side="right")
         dialog.bind("<Return>", save_on_return)
         dialog.bind("<Escape>", discard_on_escape)
         dialog.update_idletasks()
@@ -1210,12 +1581,73 @@ class AutoClicker:
         self.root.wait_window(dialog)
         return result["name"]
 
-    def _refresh_recordings(self):
+    def _refresh_recordings(self, selected_paths=None):
+        if selected_paths is None and hasattr(self, "recordings_list"):
+            selected_paths = [
+                self.recordings[index][0].name
+                for index in self.recordings_list.curselection()
+                if index < len(self.recordings)
+            ]
         self.recordings = []
         self.recordings_list.delete(0, tk.END)
+        notices = []
         if not self._recordings_dir.exists():
+            self._selected_recording = None
+            self.recordings_notice.configure(text="")
             return
-        for path in sorted(self._recordings_dir.glob("*.json"), reverse=True):
+
+        paths = {
+            path.name: path
+            for path in self._recordings_dir.glob("*.json")
+            if path != self._recordings_order_path
+        }
+        saved_names = []
+        order = []
+        manifest_valid = False
+        if self._recordings_order_path.exists():
+            try:
+                order = json.loads(
+                    self._recordings_order_path.read_text(encoding="utf-8")
+                )
+                if not isinstance(order, list) or not all(
+                    isinstance(name, str) for name in order
+                ):
+                    raise ValueError("recording order must be a list of filenames")
+                saved_names = list(
+                    dict.fromkeys(name for name in order if name in paths)
+                )
+                manifest_valid = True
+            except (json.JSONDecodeError, ValueError) as error:
+                try:
+                    backup_path = preserve_invalid_json(self._recordings_order_path)
+                except OSError as preserve_error:
+                    LOG.exception("Could not preserve invalid recording order file")
+                    notices.append(
+                        "Invalid recording order file could not be preserved: "
+                        f"{preserve_error}"
+                    )
+                else:
+                    LOG.warning(
+                        "Invalid recording order JSON in %s: %s; preserved as %s",
+                        self._recordings_order_path,
+                        error,
+                        backup_path,
+                    )
+                    notices.append(
+                        f"Invalid recording order preserved as {backup_path.name}."
+                    )
+            except OSError as error:
+                LOG.exception("Could not read recording order file")
+                notices.append(f"Could not read recording order: {error}")
+        ordered_names = [
+            path.name
+            for path in sorted(paths.values(), reverse=True)
+            if path.name not in saved_names
+        ]
+        ordered_names.extend(saved_names)
+
+        for name in ordered_names:
+            path = paths[name]
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
                 if not isinstance(data, dict):
@@ -1224,35 +1656,269 @@ class AutoClicker:
                     raise ValueError("unsupported recording format")
                 self.recordings.append((path, data))
                 self.recordings_list.insert(tk.END, data.get("name", path.stem))
-            except (OSError, json.JSONDecodeError, ValueError) as error:
-                messagebox.showwarning(
-                    APP_NAME, "Could not load %s:\n%s" % (path.name, error)
-                )
-        if self.recordings:
-            self.recordings_list.selection_set(0)
-            self._selected_recording = self.recordings[0][1]
+            except (json.JSONDecodeError, ValueError) as error:
+                try:
+                    backup_path = preserve_invalid_json(path)
+                except OSError as preserve_error:
+                    LOG.exception("Could not preserve invalid recording file %s", path)
+                    notices.append(
+                        f"{path.name} is invalid and could not be preserved: "
+                        f"{preserve_error}"
+                    )
+                else:
+                    LOG.warning(
+                        "Invalid recording JSON in %s: %s; preserved as %s",
+                        path,
+                        error,
+                        backup_path,
+                    )
+                    notices.append(
+                        f"Skipped invalid {path.name}; preserved as {backup_path.name}."
+                    )
+            except OSError as error:
+                LOG.exception("Could not read recording file %s", path)
+                notices.append(f"Could not read {path.name}: {error}")
+        loaded_names = [item[0].name for item in self.recordings]
+        if manifest_valid and order != loaded_names:
+            try:
+                write_json_atomically(self._recordings_order_path, loaded_names)
+            except OSError as error:
+                LOG.exception("Could not update recording order file")
+                notices.append(f"Could not update recording order: {error}")
+        if selected_paths:
+            selected_names = set(selected_paths)
+            for index, item in enumerate(self.recordings):
+                path = item[0]
+                if path.name in selected_names:
+                    self.recordings_list.selection_set(index)
+        if not self.recordings:
+            self._selected_recording = None
+        else:
+            selected = self.recordings_list.curselection()
+            self._selected_recording = (
+                self.recordings[selected[0]][1] if selected else None
+            )
+        self.recordings_notice.configure(text="\n".join(notices))
 
     def _on_recording_selected(self, _=None):
         selected = self.recordings_list.curselection()
         if selected:
             self._selected_recording = self.recordings[selected[0]][1]
+        else:
+            self._selected_recording = None
+
+    def _recording_row_at_y(self, y):
+        index = self.recordings_list.nearest(y)
+        if not 0 <= index < len(self.recordings):
+            return None
+        bounds = self.recordings_list.bbox(index)
+        if bounds is None:
+            return None
+        top, height = bounds[1], bounds[3]
+        return index if top <= y < top + height else None
+
+    def _on_recording_list_click(self, event):
+        if self._recording_row_at_y(event.y) is not None:
+            return
+        self.recordings_list.selection_clear(0, tk.END)
+        self._on_recording_selected()
+        self._recording_drag_start = None
+        return "break"
+
+    def _on_recording_indicator_click(self, _event):
+        if _event.widget is self._recording_drop_indicator:
+            self.recordings_list.focus_set()
+        self.recordings_list.selection_clear(0, tk.END)
+        self._on_recording_selected()
+        return "break"
+
+    def _toggle_recording_selection(self, event):
+        index = self._recording_row_at_y(event.y)
+        if index is None:
+            self.recordings_list.selection_clear(0, tk.END)
+            self._on_recording_selected()
+            return "break"
+        if index in self.recordings_list.curselection():
+            self.recordings_list.selection_clear(index)
+        else:
+            self.recordings_list.selection_set(index)
+        self.recordings_list.activate(index)
+        self._on_recording_selected()
+        return "break"
+
+    def _select_all_recordings(self, _=None):
+        if self.recordings:
+            self.recordings_list.selection_set(0, tk.END)
+            self._on_recording_selected()
+        return "break"
+
+    def _recording_drag_press(self, event):
+        if not self.recordings:
+            self._recording_drag_start = None
+            return
+        index = self._recording_row_at_y(event.y)
+        if index is None:
+            self._recording_drag_start = None
+            return
+        self._recording_drag_start = (event.x, event.y, index)
+        self._recording_drag_selection = ()
+        self._recording_dragging = False
+
+        selected = self.recordings_list.curselection()
+        if index in selected:
+            self._recording_drag_selection = tuple(selected)
+            return
+
+        def capture_new_selection():
+            selected = self.recordings_list.curselection()
+            self._recording_drag_selection = (
+                tuple(selected) if index in selected else (index,)
+            )
+
+        self.root.after_idle(capture_new_selection)
+
+    def _recording_drag_motion(self, event):
+        if self._recording_dragging:
+            self._update_recording_drop_indicator(event.y)
+            return "break"
+        if self._recording_drag_start is None:
+            return
+        start_x, start_y = self._recording_drag_start[:2]
+        if abs(event.x - start_x) + abs(event.y - start_y) < 5:
+            return
+        self._recording_dragging = True
+        self._update_recording_drop_indicator(event.y)
+        return "break"
+
+    def _update_recording_drop_indicator(self, y):
+        visible_rows = [
+            (index, self.recordings_list.bbox(index))
+            for index in range(len(self.recordings))
+        ]
+        visible_rows = [
+            (index, bounds) for index, bounds in visible_rows if bounds is not None
+        ]
+        if not visible_rows:
+            return
+
+        first_index, first_bounds = visible_rows[0]
+        insertion = first_index
+        indicator_y = first_bounds[1]
+        for index, bounds in visible_rows:
+            top, height = bounds[1], bounds[3]
+            if y < top + height / 2:
+                insertion = index
+                indicator_y = top
+                break
+            insertion = index + 1
+            indicator_y = top + height
+
+        self._recording_drop_index = insertion
+        self._recording_drop_indicator.place(
+            in_=self.recordings_list,
+            x=4,
+            y=max(0, indicator_y - 1),
+            relwidth=1,
+            width=-8,
+            height=2,
+        )
+        self._recording_drop_indicator.lift()
+
+    def _hide_recording_drop_indicator(self):
+        self._recording_drop_indicator.place_forget()
+        self._recording_drop_index = None
+
+    def _recording_drag_release(self, _event):
+        if self._recording_drag_start is None:
+            return
+        was_dragging = self._recording_dragging
+        self._recording_drag_start = None
+        self._recording_dragging = False
+        if not was_dragging:
+            return
+
+        self._update_recording_drop_indicator(_event.y)
+        insertion = self._recording_drop_index
+        self._hide_recording_drop_indicator()
+        if insertion is None:
+            return "break"
+
+        selected = sorted(set(self._recording_drag_selection))
+        if not selected:
+            return "break"
+        selected_set = set(selected)
+        moving = [self.recordings[index] for index in selected]
+        remaining = [
+            item for index, item in enumerate(self.recordings)
+            if index not in selected_set
+        ]
+        insertion -= sum(index < insertion for index in selected)
+        insertion = max(0, min(insertion, len(remaining)))
+        reordered = remaining[:insertion] + moving + remaining[insertion:]
+        if reordered != self.recordings:
+            self.recordings = reordered
+            selected_names = [item[0].name for item in moving]
+            try:
+                self._recordings_dir.mkdir(parents=True, exist_ok=True)
+                write_json_atomically(
+                    self._recordings_order_path,
+                    [item[0].name for item in reordered],
+                )
+            except OSError as error:
+                messagebox.showerror(
+                    APP_NAME, "Could not save recording order:\n%s" % error
+                )
+            self._refresh_recordings(selected_names)
+        return "break"
 
     def _play_selected(self):
-        self._on_recording_selected()
-        if self._selected_recording is None:
-            return
+        self._refresh_trust_state()
+        LOG.info(
+            "[ACTION BUTTON] Play selected recording: accessibility=%s "
+            "input_monitoring=%s bundle_id=%s executable=%s bundle_path=%s",
+            bool(self._was_trusted),
+            bool(self._last_input_monitoring_trusted),
+            APP_BUNDLE_ID,
+            sys.executable,
+            self._app_bundle_path,
+        )
+        selected = self.recordings_list.curselection()
         if self.running or self._playing_recording:
             self._stop_action()
             return
-        if not is_ax_trusted():
-            self._refresh_trust_state()
-            request_accessibility_permission()
+        if not selected:
+            return
+        if len(selected) != 1:
+            messagebox.showinfo(APP_NAME, "Select exactly one recording to play.")
+            return
+        if not self._was_trusted:
             LOG.warning("Cannot play recording: Accessibility permission is missing")
-            messagebox.showwarning(APP_NAME, "Requires Accessibility.")
+            self._show_accessibility_required()
             return
         if self.record_var.get():
             self._stop_recording()
-        events = self._selected_recording["events"]
+        recording = self.recordings[selected[0]][1]
+        events = list(recording["events"])
+        if not events:
+            messagebox.showerror(APP_NAME, "This recording contains no events.")
+            return
+        if self.play_forever_var.get():
+            repeat_count = None
+        else:
+            count_text = (
+                ""
+                if self._playback_count_placeholder_active
+                else self.playback_count_var.get()
+            )
+            try:
+                repeat_count = int(count_text)
+            except ValueError:
+                repeat_count = 0
+            if repeat_count < 1:
+                messagebox.showerror(
+                    APP_NAME, "Enter a whole number of plays greater than zero."
+                )
+                return
         keyboard_controller = self._get_keyboard_controller()
         from pynput.mouse import Controller as MouseController
 
@@ -1260,48 +1926,80 @@ class AutoClicker:
         self._playing_recording = True
         self._stop_event.clear()
         self._set_status("Started")
-        self._playback_thread = threading.Thread(
-            target=self._play_recording,
-            args=(events, keyboard_controller, mouse_controller),
-            daemon=True,
-        )
-        self._playback_thread.start()
+        try:
+            self._playback_thread = threading.Thread(
+                target=self._play_recording,
+                args=(events, keyboard_controller, mouse_controller, repeat_count),
+                daemon=True,
+            )
+            self._playback_thread.start()
+            LOG.info(
+                "Recording playback worker started: event_count=%s repeat_count=%s",
+                len(events),
+                repeat_count if repeat_count is not None else "forever",
+            )
+        except Exception as error:
+            self._playing_recording = False
+            self._stop_event.set()
+            LOG.exception("Failed to initialize or start recording playback")
+            self._set_status("Stopped")
+            messagebox.showerror(APP_NAME, f"Could not start playback:\n{error}")
 
-    def _play_recording(self, events, keyboard_controller, mouse_controller):
+    def _play_recording(
+        self, events, keyboard_controller, mouse_controller, repeat_count=1
+    ):
         pressed_keys = set()
         pressed_buttons = set()
+        last_mouse_down_at = None
         try:
             from pynput.mouse import Button
 
-            started = time.monotonic()
-            for event in events:
-                wait = event["time"] - (time.monotonic() - started)
-                if self._stop_event.wait(max(0, wait)):
-                    break
-                kind = event["type"]
-                if kind == "key_down":
-                    key = _deserialize_key(event["key"])
-                    keyboard_controller.press(key)
-                    pressed_keys.add(key)
-                elif kind == "key_up":
-                    key = _deserialize_key(event["key"])
+            completed = 0
+            while repeat_count is None or completed < repeat_count:
+                started = time.monotonic()
+                for event in events:
+                    deadline = started + max(0, event["time"])
+                    if event["type"] == "mouse_down" and last_mouse_down_at is not None:
+                        deadline = max(
+                            deadline,
+                            last_mouse_down_at + MIN_INTERVAL_SECONDS,
+                        )
+                    wait = deadline - time.monotonic()
+                    if self._stop_event.wait(max(0, wait)):
+                        return
+                    kind = event["type"]
+                    if kind == "key_down":
+                        key = _deserialize_key(event["key"])
+                        keyboard_controller.press(key)
+                        pressed_keys.add(key)
+                    elif kind == "key_up":
+                        key = _deserialize_key(event["key"])
+                        keyboard_controller.release(key)
+                        pressed_keys.discard(key)
+                    elif kind == "mouse_move":
+                        mouse_controller.position = (event["x"], event["y"])
+                    elif kind in ("mouse_down", "mouse_up"):
+                        mouse_controller.position = (event["x"], event["y"])
+                        button = getattr(Button, event["button"])
+                        if kind == "mouse_down":
+                            mouse_controller.press(button)
+                            last_mouse_down_at = time.monotonic()
+                            pressed_buttons.add(button)
+                        else:
+                            mouse_controller.release(button)
+                            pressed_buttons.discard(button)
+                    elif kind == "mouse_scroll":
+                        mouse_controller.position = (event["x"], event["y"])
+                        mouse_controller.scroll(event["dx"], event["dy"])
+                completed += 1
+                for key in pressed_keys:
                     keyboard_controller.release(key)
-                    pressed_keys.discard(key)
-                elif kind == "mouse_move":
-                    mouse_controller.position = (event["x"], event["y"])
-                elif kind in ("mouse_down", "mouse_up"):
-                    mouse_controller.position = (event["x"], event["y"])
-                    button = getattr(Button, event["button"])
-                    if kind == "mouse_down":
-                        mouse_controller.press(button)
-                        pressed_buttons.add(button)
-                    else:
-                        mouse_controller.release(button)
-                        pressed_buttons.discard(button)
-                elif kind == "mouse_scroll":
-                    mouse_controller.position = (event["x"], event["y"])
-                    mouse_controller.scroll(event["dx"], event["dy"])
-        except (KeyError, OSError, TypeError, ValueError, RuntimeError) as error:
+                pressed_keys.clear()
+                for button in pressed_buttons:
+                    mouse_controller.release(button)
+                pressed_buttons.clear()
+        except Exception as error:
+            LOG.exception("Recording playback failed")
             if not self._closed:
                 self.root.after(
                     0, lambda err=error: messagebox.showerror(
@@ -1310,10 +2008,19 @@ class AutoClicker:
                 )
         finally:
             for key in pressed_keys:
-                keyboard_controller.release(key)
+                try:
+                    keyboard_controller.release(key)
+                except Exception:
+                    LOG.exception("Failed to release a key after recording playback")
             for button in pressed_buttons:
-                mouse_controller.release(button)
+                try:
+                    mouse_controller.release(button)
+                except Exception:
+                    LOG.exception(
+                        "Failed to release a mouse button after recording playback"
+                    )
             self._playing_recording = False
+            LOG.info("Recording playback worker exited")
             if not self._closed:
                 self.root.after(0, self._set_stopped)
 
@@ -1326,14 +2033,24 @@ class AutoClicker:
         selected = self.recordings_list.curselection()
         if not selected:
             return
-        path, _ = self.recordings[selected[0]]
-        if not messagebox.askyesno(APP_NAME, "Delete this recording?"):
+        selected_items = [self.recordings[index] for index in selected]
+        count = len(selected_items)
+        prompt = (
+            "Delete this recording?"
+            if count == 1
+            else f"Delete these {count} recordings?"
+        )
+        if not messagebox.askyesno(APP_NAME, prompt):
             return
-        try:
-            path.unlink()
-        except OSError as error:
-            messagebox.showerror(APP_NAME, "Could not delete recording:\n%s" % error)
-            return
+        for item in selected_items:
+            path = item[0]
+            try:
+                path.unlink()
+            except OSError as error:
+                messagebox.showerror(
+                    APP_NAME, "Could not delete recording:\n%s" % error
+                )
+                break
         self._selected_recording = None
         self._refresh_recordings()
 

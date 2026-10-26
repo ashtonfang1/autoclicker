@@ -6,6 +6,7 @@ DATA_FILES = [('Resources', ['README.md', APP_ICON])]
 OPTIONS = {
     "argv_emulation": False,
     "packages": ["pyautogui", "pynput"],
+    "includes": ["ApplicationServices"],
     "excludes": ["PIL", "numpy", "cv2", "matplotlib"],
     "iconfile": APP_ICON,
     "plist": {
@@ -14,6 +15,7 @@ OPTIONS = {
         "CFBundleIdentifier": "com.ashton.autoclicker",
         "CFBundleVersion": "1.0.0",
         "CFBundlePackageType": "APPL",
+        "LSUIElement": False,
         "NSHighResolutionCapable": True,
         "NSRequiresAquaSystemAppearance": False,
     },

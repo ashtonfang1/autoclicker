@@ -37,7 +37,7 @@ class LMBToggle:
         self.root.title("LMB Toggle")
         self.root.geometry("250x140")
         self.root.resizable(False, False)
-        self.root.attributes("-topmost", True)
+        self.root.attributes("-topmost", False)
 
         tk.Label(self.root, text="Delay (ms):").grid(
             row=0, column=0, padx=8, pady=10, sticky="w"
